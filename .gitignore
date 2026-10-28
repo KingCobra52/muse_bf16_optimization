@@ -1,0 +1,18 @@
+#Common .gitignore for python projects
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+env/
+.env
+.idea/
+.vscode/
+.DS_Store
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+#enviorment var
+muse_spark/ 
