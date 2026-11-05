@@ -1,11 +1,14 @@
 # okc: problem=muse_bf16_proj
 """Dense projections of Muse Spark Open.
 
-Step 1 (library path): m > SKINNY_MAX goes to cuBLAS (torch.mm); the router uses the BF16 hi + lo
-split with FP32 accumulation, as SGLang does above 8 tokens.
-Step 2 (prototype): m <= SKINNY_MAX uses a Triton swap-AB split-K kernel. The weight rows fill the
-tensor-core M slot and the (padded) tokens fill the N slot, so the kernel streams W once at HBM
-speed. Split-K spreads the stream over all SMs; a second tiny kernel sums the partials and casts.
+m > SKINNY_MAX goes to cuBLAS (torch.mm); the router uses the BF16 hi + lo split with FP32
+accumulation, as SGLang does above 8 tokens.
+
+m <= SKINNY_MAX uses ONE Triton swap-AB split-K kernel. The weight rows fill the tensor-core M slot
+and the (padded) tokens fill the N slot, so the kernel streams W once. Split-K spreads the stream
+over all SMs. Each CTA writes its FP32 partial to a workspace, then bumps a per-tile counter; the
+last CTA of a tile sums the partials, casts, writes the output and resets the counter to 0 (so the
+counters are ready for the next replay). No second launch.
 """
 
 from typing import TypedDict
@@ -16,6 +19,7 @@ import triton.language as tl
 
 SKINNY_MAX = 32
 TARGET_CTAS = 264  # 2 x 132 SMs on H200
+MAX_TILES = 1024   # counters per call (n // bn <= 512)
 
 
 class Weights(TypedDict):
@@ -39,10 +43,10 @@ class Inputs(TypedDict):
 
 
 @triton.jit
-def _splitk_kernel(x_ptr, w_ptr, w2_ptr, ws_ptr, M, N, K, K_PER_SPLIT,
-                   BN: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr,
-                   TWO: tl.constexpr, STAGES: tl.constexpr):
-    """ws[s, m, n] = sum over this split's k range of x[m, k] * (w + w2)[n, k]  (fp32)."""
+def _gemm_kernel(x_ptr, w_ptr, w2_ptr, ws_ptr, cnt_ptr, out_ptr, M, N, K, K_PER_SPLIT, SPLITS,
+                 BN: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr,
+                 TWO: tl.constexpr, STAGES: tl.constexpr):
+    """out[m, n] = sum_k x[m, k] * (w + w2)[n, k], split over k across program_id(1)."""
     pid_n = tl.program_id(0)
     pid_s = tl.program_id(1)
     offs_n = pid_n * BN + tl.arange(0, BN)
@@ -52,24 +56,28 @@ def _splitk_kernel(x_ptr, w_ptr, w2_ptr, ws_ptr, M, N, K, K_PER_SPLIT,
     for k0 in tl.range(k_begin, k_begin + K_PER_SPLIT, BK, num_stages=STAGES):
         offs_k = k0 + tl.arange(0, BK)
         w = tl.load(w_ptr + offs_n[:, None] * K + offs_k[None, :])
-        xt = tl.load(x_ptr + offs_m[None, :] * K + offs_k[:, None],
-                     mask=offs_m[None, :] < M, other=0.0)
+        xr = tl.load(x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                     mask=offs_m[:, None] < M, other=0.0)  # [BM, BK], k contiguous (coalesced)
+        xt = tl.trans(xr)
         acc = tl.dot(w, xt, acc)
         if TWO:
             w2 = tl.load(w2_ptr + offs_n[:, None] * K + offs_k[None, :])
             acc = tl.dot(w2, xt, acc)
-    out_ptrs = ws_ptr + pid_s * M * N + offs_m[None, :] * N + offs_n[:, None]
-    tl.store(out_ptrs, acc, mask=offs_m[None, :] < M)
-
-
-@triton.jit
-def _reduce_kernel(ws_ptr, out_ptr, TOTAL, SPLITS: tl.constexpr, BLOCK: tl.constexpr):
-    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < TOTAL
-    acc = tl.zeros((BLOCK,), dtype=tl.float32)
-    for s in tl.static_range(SPLITS):
-        acc += tl.load(ws_ptr + s * TOTAL + offs, mask=mask, other=0.0)
-    tl.store(out_ptr + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
+    tile_off = offs_m[None, :] * N + offs_n[:, None]
+    mask = offs_m[None, :] < M
+    if SPLITS == 1:
+        tl.store(out_ptr + tile_off, acc.to(out_ptr.dtype.element_ty), mask=mask)
+    else:
+        tl.store(ws_ptr + pid_s * M * N + tile_off, acc, mask=mask)
+        tl.debug_barrier()
+        done = tl.atomic_add(cnt_ptr + pid_n, 1)  # acq_rel, gpu scope
+        if done == SPLITS - 1:
+            total = tl.zeros((BN, BM), dtype=tl.float32)
+            for s in range(SPLITS):
+                total += tl.load(ws_ptr + s * M * N + tile_off, mask=mask, other=0.0,
+                                 cache_modifier=".cg")
+            tl.store(out_ptr + tile_off, total.to(out_ptr.dtype.element_ty), mask=mask)
+            tl.store(cnt_ptr + pid_n, 0)
 
 
 def _pow2_ceil(v: int) -> int:
@@ -79,23 +87,57 @@ def _pow2_ceil(v: int) -> int:
     return p
 
 
-def _skinny(x, w, w2, n, out_dtype):
-    m, k = x.shape
-    # BN is the tensor-core M slot (>=16); BM is the token slot (>=16 for tl.dot).
-    bn = 16 if w2 is not None else 32
+def _default_cfg(layer, m, n, k):
+    two = layer == "router"
+    bn = 16 if two else 32
     bm = 16 if m <= 16 else 32
-    bk = 128 if w2 is not None else 256
+    bk = 128 if two else 256
     n_blocks = n // bn
     splits = min(max(1, k // 512), _pow2_ceil(-(-TARGET_CTAS // n_blocks)))
     while k % (splits * bk):
         splits //= 2
-    ws = torch.empty((splits, m, n), dtype=torch.float32, device=x.device)
-    _splitk_kernel[(n_blocks, splits)](
-        x, w, w2 if w2 is not None else w, ws, m, n, k, k // splits,
-        BN=bn, BM=bm, BK=bk, TWO=w2 is not None, STAGES=4, num_warps=4)
+    return dict(bn=bn, bm=bm, bk=bk, stages=4, warps=4, splits=splits)
+
+
+def _c(bn, bk, stages, warps, splits):
+    return dict(bn=bn, bk=bk, stages=stages, warps=warps, splits=splits)
+
+
+# (layer, bm) -> config found by an on-GPU sweep of CUDA-graph replays (cold L2)
+TUNED = {
+    ("qkv_gate", 16): _c(64, 256, 4, 4, 2), ("qkv_gate", 32): _c(64, 256, 4, 4, 2),
+    ("o", 16): _c(64, 128, 4, 4, 1),        ("o", 32): _c(64, 128, 4, 4, 1),
+    ("pooler", 16): _c(64, 256, 4, 4, 1),   ("pooler", 32): _c(32, 256, 6, 4, 1),
+    ("unpooler", 16): _c(64, 256, 4, 4, 1), ("unpooler", 32): _c(64, 256, 4, 4, 1),
+    ("router", 16): _c(32, 128, 4, 2, 16),  ("router", 32): _c(16, 128, 4, 4, 16),
+}
+MIN_CTAS = 128
+
+
+def _pick(layer, m, n, k):
+    cfg = _default_cfg(layer, m, n, k)
+    bm = cfg["bm"]
+    over = TUNED.get((layer, bm))
+    if over:
+        cfg = dict(over, bm=bm)
+    # a small n (the sliced unpooler) needs split-K to keep the SMs fed
+    while (n // cfg["bn"]) * cfg["splits"] < MIN_CTAS and k % (cfg["splits"] * 2 * cfg["bk"]) == 0:
+        cfg["splits"] *= 2
+    while k % (cfg["splits"] * cfg["bk"]):
+        cfg["splits"] //= 2
+    return cfg
+
+
+def _skinny(x, w, w2, cnt, n, out_dtype, cfg):
+    m, k = x.shape
+    bn, splits = cfg["bn"], cfg["splits"]
+    n_blocks = n // bn
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
-    total = m * n
-    _reduce_kernel[(triton.cdiv(total, 1024),)](ws, out, total, SPLITS=splits, BLOCK=1024)
+    ws = torch.empty((splits, m, n) if splits > 1 else (1,), dtype=torch.float32, device=x.device)
+    _gemm_kernel[(n_blocks, splits)](
+        x, w, w2 if w2 is not None else w, ws, cnt, out, m, n, k, k // splits, splits,
+        BN=bn, BM=cfg["bm"], BK=cfg["bk"], TWO=w2 is not None, STAGES=cfg["stages"],
+        num_warps=cfg["warps"])
     return out
 
 
@@ -108,19 +150,24 @@ def prepare(weights: Weights):
     state["router_lo"] = lo.contiguous()
     state["router_hi_t"] = hi.t().contiguous()            # [8192, 256], for the cuBLAS path
     state["router_lo_t"] = lo.t().contiguous()
+    # split-K arrival counters; the last CTA of a tile resets its counter, so they stay zero between calls
+    state["cnt"] = torch.zeros(MAX_TILES, dtype=torch.int32, device=router.device)
     return state
 
 
 def kernel_fn(data: Inputs, state) -> torch.Tensor:
     x, cfg = data["x"], data["config"]
     layer, n, m = cfg["layer"], cfg["n"], x.shape[0]
+    k = x.shape[1]
     if layer == "router":
         if m <= SKINNY_MAX:
-            return _skinny(x, state["router_hi"], state["router_lo"], n, torch.float32)
+            return _skinny(x, state["router_hi"], state["router_lo"], state["cnt"], n,
+                           torch.float32, _pick(layer, m, n, k))
         acc = torch.mm(x, state["router_hi_t"], out_dtype=torch.float32)
         acc += torch.mm(x, state["router_lo_t"], out_dtype=torch.float32)
         return acc
     w = state[layer][:n]
-    if m <= SKINNY_MAX:
-        return _skinny(x, w, None, n, torch.bfloat16)
+    # qkv_gate: the Triton kernel still loses to cuBLAS here, so it stays on the library path
+    if m <= SKINNY_MAX and layer != "qkv_gate":
+        return _skinny(x, w, None, state["cnt"], n, torch.bfloat16, _pick(layer, m, n, k))
     return x @ w.T

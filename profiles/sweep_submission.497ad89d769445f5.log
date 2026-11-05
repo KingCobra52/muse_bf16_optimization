@@ -1,0 +1,12 @@
+SWEEP start
+SWEEP qkv_gate m=16 n=2304: default 22.143999114632607 -> 20.99199965596199 us  cfg={'bn': 64, 'bm': 16, 'bk': 256, 'stages': 4, 'warps': 4, 'splits': 2}
+SWEEP qkv_gate m=32 n=2304: default 27.008000761270523 -> 21.79200015962124 us  cfg={'bn': 64, 'bm': 32, 'bk': 256, 'stages': 4, 'warps': 4, 'splits': 2}
+SWEEP o m=16 n=8192: default 14.751999638974667 -> 11.839999817311764 us  cfg={'bn': 64, 'bm': 16, 'bk': 128, 'stages': 4, 'warps': 4, 'splits': 1}
+SWEEP o m=32 n=8192: default 16.607999801635742 -> 11.96799986064434 us  cfg={'bn': 64, 'bm': 32, 'bk': 128, 'stages': 4, 'warps': 4, 'splits': 1}
+SWEEP pooler m=16 n=4096: default 32.70399942994118 -> 29.279999434947968 us  cfg={'bn': 64, 'bm': 16, 'bk': 256, 'stages': 4, 'warps': 4, 'splits': 1}
+SWEEP pooler m=32 n=4096: default 33.72799977660179 -> 29.184000566601753 us  cfg={'bn': 32, 'bm': 32, 'bk': 256, 'stages': 6, 'warps': 4, 'splits': 1}
+SWEEP unpooler m=16 n=8192: default 32.70399942994118 -> 27.615999802947044 us  cfg={'bn': 64, 'bm': 16, 'bk': 256, 'stages': 4, 'warps': 4, 'splits': 1}
+SWEEP unpooler m=32 n=8192: default 33.504001796245575 -> 28.031999245285988 us  cfg={'bn': 64, 'bm': 32, 'bk': 256, 'stages': 4, 'warps': 4, 'splits': 1}
+SWEEP router m=16 n=256: default 12.000000104308128 -> 11.52000017464161 us  cfg={'bn': 32, 'bm': 16, 'bk': 128, 'stages': 4, 'warps': 2, 'splits': 16}
+SWEEP router m=32 n=256: default 12.032000347971916 -> 12.032000347971916 us  cfg={'bn': 16, 'bm': 32, 'bk': 128, 'stages': 4, 'warps': 4, 'splits': 16}
+SWEEP done in 22s

@@ -43,7 +43,7 @@ class Inputs(TypedDict):
 ROUTER_FP32_MAX_TOKENS = 8
 
 
-def prepare(weights):
+def prepare(weights): 
     state = {name: w.contiguous() for name, w in weights.items()}
     router = weights["router"]
     hi = router.to(torch.bfloat16)
